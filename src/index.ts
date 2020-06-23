@@ -1,11 +1,12 @@
 import ssf from 'ssf';
-import { Transform } from 'stream';
+import { Transform, PassThrough, Readable } from 'stream';
 import { ReadStream } from 'tty';
 
-import { IMergedCellDictionary, IWorksheetOptions, IXlsxStreamOptions, IXlsxStreamsOptions, IWorksheet } from './types';
+import { IWorksheetOptions, IXlsxStreamOptions, IWorksheet } from './types';
 
-const StreamZip = require('node-stream-zip');
+const unzip = require('unzip-stream');
 const saxStream = require('sax-stream');
+const Combine = require('stream-combiner');
 
 function lettersToNumber(letters: string) {
     return letters.split('').reduce((r, a) => r * 26 + parseInt(a, 36) - 9, 0);
@@ -37,16 +38,7 @@ function applyHeaderToObj(obj: any, header: any) {
     return newObj;
 }
 
-function fillMergedCells(dict: IMergedCellDictionary, currentRowName: any, arr: any, obj: any, formattedArr: any, formattedObj: any) {
-    for (const columnName of Object.keys(dict[currentRowName])) {
-        const parentCell = dict[currentRowName][columnName].parent;
-        const index = lettersToNumber(columnName) - 1;
-        arr[index] = obj[columnName] = dict[parentCell.row][parentCell.column].value.raw;
-        formattedArr[index] = formattedObj[columnName] = dict[parentCell.row][parentCell.column].value.formatted;
-    }
-}
-
-function getTransform(formats: (string | number)[], strings: string[], dict?: IMergedCellDictionary, withHeader?: boolean, ignoreEmpty?: boolean) {
+function getTransform(formats: (string | number)[], strings: string[], withHeader?: boolean, ignoreEmpty?: boolean) {
     let lastReceivedRow: number;
     let header: any[] = [];
     return new Transform({
@@ -73,9 +65,6 @@ function getTransform(formats: (string | number)[], strings: string[], dict?: IM
                     value = isNaN(value) ? value : Number(value);
                     let column = ch.attribs.r.replace(/[0-9]/g, '');
                     const index = lettersToNumber(column) - 1;
-                    if (dict?.[lastReceivedRow]?.[column]) {
-                        dict[lastReceivedRow][column].value.raw = value;
-                    }
                     arr[index] = value;
                     obj[column] = value;
                     const formatId = ch.attribs.s ? Number(ch.attribs.s) : 0;
@@ -83,15 +72,9 @@ function getTransform(formats: (string | number)[], strings: string[], dict?: IM
                         value = ssf.format(formats[formatId], value);
                         value = isNaN(value) ? value : Number(value);
                     }
-                    if (dict?.[lastReceivedRow]?.[column]) {
-                        dict[lastReceivedRow][column].value.formatted = value;
-                    }
                     formattedArr[index] = value;
                     formattedObj[column] = value;
                 }
-            }
-            if (dict?.[lastReceivedRow]) {
-                fillMergedCells(dict, lastReceivedRow, arr, obj, formattedArr, formattedObj);
             }
             if (withHeader && !header.length) {
                 for (let i = 0; i < arr.length; i++) {
@@ -114,95 +97,33 @@ function getTransform(formats: (string | number)[], strings: string[], dict?: IM
             }
         },
         flush(callback) {
-            if (dict) {
-                const unprocessedRows = Object.keys(dict).map(x => Number(x)).filter(x => x > lastReceivedRow);
-                for (const unprocessedRow of unprocessedRows) {
-                    let arr: any[] = [];
-                    let formattedArr: any[] = [];
-                    let obj: any = {};
-                    let formattedObj: any = {};
-                    fillMergedCells(dict, unprocessedRow, arr, obj, formattedArr, formattedObj);
-                    this.push((ignoreEmpty && !arr.length) ? null : {
-                        raw: {
-                            obj: applyHeaderToObj(obj, header),
-                            arr
-                        },
-                        formatted: {
-                            obj: applyHeaderToObj(formattedObj, header),
-                            arr: formattedArr,
-                        },
-                        header,
-                    });
-                }
-            }
             callback();
         }
     })
 }
 
-export async function getXlsxStream(options: IXlsxStreamOptions): Promise<Transform> {
-    const generator = getXlsxStreams({
-        filePath: options.filePath,
-        sheets: [{
-            id: options.sheet,
-            withHeader: options.withHeader,
-            ignoreEmpty: options.ignoreEmpty,
-            fillMergedCells: options.fillMergedCells,
-        }]
-    });
-    const stream = await generator.next();
-    return stream.value;
-}
-
-export async function* getXlsxStreams(options: IXlsxStreamsOptions): AsyncGenerator<Transform> {
+export function getXlsxStream (options: IXlsxStreamOptions): Transform {
     const sheets: string[] = [];
     const numberFormats: any = {};
     const formats: (string | number)[] = [];
     const strings: string[] = [];
-    const zip = new StreamZip({
-        file: options.filePath,
-        storeEntries: true
-    });
-    let currentSheetIndex = 0;
-    function setupGenericData() {
-        return new Promise((resolve, reject) => {
-            function processSharedStrings(numberFormats: any, formats: (string | number)[]) {
-                for (let i = 0; i < formats.length; i++) {
-                    const format = numberFormats[formats[i]];
-                    if (format) {
-                        formats[i] = format;
-                    }
-                }
-                zip.stream('xl/sharedStrings.xml', (err: any, stream: ReadStream) => {
-                    if (stream) {
-                        stream.pipe(saxStream({
-                            strict: true,
-                            tag: 'si'
-                        })).on('data', (x: any) => {
-                            if (x.children.t) {
-                                strings.push(x.children.t.value);
-                            } else if (!x.children.r.length) {
-                                strings.push(x.children.r.children.t.value);
-                            } else {
-                                let str = '';
-                                for (let i = 0; i < x.children.r.length; i++) {
-                                    str += x.children.r[i].children.t.value;
-                                }
-                                strings.push(str);
-                            }
-                        });
-                        stream.on('end', () => {
-                            resolve();
-                        });
-                    } else {
-                        resolve();
-                    }
-                });
-            }
-
-            function processStyles() {
-                zip.stream(`xl/styles.xml`, (err: any, stream: ReadStream) => {
-                    stream.pipe(saxStream({
+    const sheetId = options.sheet + 1
+    return Combine(unzip.Parse(), new Transform({
+        objectMode: true,
+        transform: function(entry, e, cb) {
+            const filePath = entry.path;
+            switch (filePath) {
+                case 'xl/workbook.xml':
+                    entry.pipe(saxStream({
+                        strict: true,
+                        tag: 'sheet'
+                    })).on('data', (x: any) => {
+                        const attribs = x.attribs;
+                        sheets.push(attribs.name);
+                    }).on('end', cb);
+                    break;
+                case 'xl/styles.xml':
+                    entry.pipe(saxStream({
                         strict: true,
                         tag: ['cellXfs', 'numFmts']
                     })).on('data', (x: any) => {
@@ -217,143 +138,92 @@ export async function* getXlsxStreams(options: IXlsxStreamsOptions): AsyncGenera
                                 formats[i] = Number(ch.attribs.numFmtId);
                             }
                         }
-                    });
-                    stream.on('end', () => {
-                        processSharedStrings(numberFormats, formats);
-                    });
-                });
-            }
-
-            function processWorkbook() {
-                zip.stream('xl/workbook.xml', (err: any, stream: ReadStream) => {
-                    stream.pipe(saxStream({
-                        strict: true,
-                        tag: 'sheet'
-                    })).on('data', (x: any) => {
-                        const attribs = x.attribs;
-                        sheets.push(attribs.name);
-                    });
-                    stream.on('end', () => {
-                        processStyles();
-                    });
-                });
-            }
-
-            zip.on('ready', () => {
-                processWorkbook();
-            });
-            zip.on('error', (err: any) => {
-                reject(new Error(err));
-            });
-        });
-    }
-    function getMergedCellDictionary(sheetId: string) {
-        return new Promise<IMergedCellDictionary>((resolve, reject) => {
-            zip.stream(`xl/worksheets/sheet${sheetId}.xml`, (err: any, stream: ReadStream) => {
-                const dict: IMergedCellDictionary = {};
-                const readStream = stream
-                    .pipe(saxStream({
-                        strict: true,
-                        tag: 'mergeCell'
-                    }));
-                readStream.on('end', () => {
-                    resolve(dict);
-                });
-                readStream.on('data', (a: any) => {
-                    const mergedCellRange: string = a.attribs.ref;
-                    const mergedCellRangeSplit = mergedCellRange.split(':');
-                    const mergedCellRangeStart = mergedCellRangeSplit[0];
-                    const mergedCellRangeEnd = mergedCellRangeSplit[1];
-                    let columnLetterStart = mergedCellRangeStart.replace(/[0-9]/g, '');
-                    let columnNumberStart = lettersToNumber(columnLetterStart);
-                    let rowNumberStart = Number(mergedCellRangeStart.replace(columnLetterStart, ''));
-                    let columnLetterEnd = mergedCellRangeEnd.replace(/[0-9]/g, '');
-                    let columnNumberEnd = lettersToNumber(columnLetterEnd);
-                    let rowNumberEnd = Number(mergedCellRangeEnd.replace(columnLetterEnd, ''));
-                    for (let rowNumber = rowNumberStart; rowNumber <= rowNumberEnd; rowNumber++) {
-                        for (let columnNumber = columnNumberStart; columnNumber <= columnNumberEnd; columnNumber++) {
-                            const columnLetter = numbersToLetter(columnNumber);
-                            if (!dict[rowNumber]) {
-                                dict[rowNumber] = {};
-                            }
-                            dict[rowNumber][columnLetter] = {
-                                parent: {
-                                    column: columnLetterStart,
-                                    row: rowNumberStart,
-                                },
-                                value: { formatted: null, raw: null },
+                    }).on('end', () => {
+                        for (let i = 0; i < formats.length; i++) {
+                            const format = numberFormats[formats[i]];
+                            if (format) {
+                                formats[i] = format;
                             }
                         }
-                    }
-                });
-                readStream.resume();
-            });
-        });
-    }
-    async function getSheetTransform(sheetId: string, withHeader?: boolean, ignoreEmpty?: boolean, fillMergedCells?: boolean) {
-        let dict: IMergedCellDictionary | undefined;
-        if (fillMergedCells) {
-            dict = await getMergedCellDictionary(sheetId);
-        }
-        return new Promise<Transform>((resolve, reject) => {
-            zip.stream(`xl/worksheets/sheet${sheetId}.xml`, (err: any, stream: ReadStream) => {
-                const readStream = stream
-                    .pipe(saxStream({
+                        return cb();
+                    });
+                    break;
+                case 'xl/sharedStrings.xml':
+                    console.log({ SHAREDSTRINGS: '1' })
+                    entry.pipe(saxStream({
                         strict: true,
-                        tag: 'row'
-                    }))
-                    .pipe(getTransform(formats, strings, dict, withHeader, ignoreEmpty));
-                readStream.on('end', () => {
-                    if (currentSheetIndex + 1 === options.sheets.length) {
-                        zip.close();
+                        tag: 'si'
+                    })).on('data', (x: any) => {
+                        if (x.children.t) {
+                            strings.push(x.children.t.value);
+                        } else if (!x.children.r.length) {
+                            strings.push(x.children.r.children.t.value);
+                        } else {
+                            let str = '';
+                            for (let i = 0; i < x.children.r.length; i++) {
+                                str += x.children.r[i].children.t.value;
+                            }
+                            strings.push(str);
+                        }
+                    }).on('end', cb);
+                    break;
+                case `xl/worksheets/sheet${sheetId}.xml`:
+                    console.log({ SHEET: '1' })
+                    const self = this   
+                    const pushChunk = function (chunk: any) {
+                        if (self.readableLength >= self.readableHighWaterMark) {
+                            // Not ready to push now
+                            return process.nextTick(pushChunk, [chunk])
+                        }
+                        return self.push(chunk)
                     }
-                });
-                resolve(readStream);
-            });
-        });
-    }
-    await setupGenericData();
-    for (currentSheetIndex = 0; currentSheetIndex < options.sheets.length; currentSheetIndex++) {
-        const id = options.sheets[currentSheetIndex].id;
-        let sheetId: string = '';
-        if (typeof id === 'number') {
-            sheetId = `${id + 1}`;
-        } else if (typeof id === 'string') {
-            sheetId = `${sheets.indexOf(id) + 1}`;
+                    entry
+                        .pipe(saxStream({
+                            strict: true,
+                            tag: 'row'
+                        }))
+                        .pipe(getTransform(formats, strings, options.withHeader, options.ignoreEmpty))
+                        .on('data', (chunk: any) => {
+                            return pushChunk(chunk)
+                        })
+                        .on('end', cb);
+                    break;
+                default:
+                    entry.autodrain();
+                    return cb();
+                    
+            }
         }
-        const transform = await getSheetTransform(sheetId, options.sheets[currentSheetIndex].withHeader, options.sheets[currentSheetIndex].ignoreEmpty, options.sheets[currentSheetIndex].fillMergedCells);
-
-        yield transform;
-    }
+    }))
 }
 
 export function getWorksheets(options: IWorksheetOptions) {
+    const sheets: IWorksheet[] = [];
     return new Promise<IWorksheet[]>((resolve, reject) => {
-        function processWorkbook() {
-            zip.stream('xl/workbook.xml', (err: any, stream: ReadStream) => {
-                stream.pipe(saxStream({
-                    strict: true,
-                    tag: 'sheet'
-                })).on('data', (x: any) => {
-                    sheets.push({
-                        name: x.attribs.name,
-                        hidden: x.attribs.state && x.attribs.state === 'hidden' ? true : false,
-                    });
-                });
-                stream.on('end', () => {
-                    zip.close();
-                    resolve(sheets);
-                });
-            });
-        }
-
-        let sheets: IWorksheet[] = [];
-        const zip = new StreamZip({
-            file: options.filePath,
-            storeEntries: true,
-        });
-        zip.on('ready', () => {
-            processWorkbook();
-        });
-    });
+        options.stream
+            .pipe(unzip.Parse())
+            .pipe(new Transform({
+                objectMode: true,
+                transform: function(entry,e,cb) {
+                    const filePath = entry.path;
+                    if (filePath === 'xl/workbook.xml') {
+                        return entry
+                            .pipe(saxStream({
+                                strict: true,
+                                tag: 'sheet'
+                            })).on('data', (x: any) => {
+                                this.push({
+                                    name: x.attribs.name,
+                                    hidden: x.attribs.state && x.attribs.state === 'hidden' ? true : false,
+                                });
+                            }).on('end', cb);
+                    }
+                    entry.autodrain();
+                    return cb();
+                }
+            }))
+            .on('data', (sheet: IWorksheet) => sheets.push(sheet))
+            .on('end', () => resolve(sheets))
+            .on('error', reject);
+    })
 }

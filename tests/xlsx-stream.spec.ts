@@ -1,13 +1,11 @@
-import { getXlsxStream, getXlsxStreams, getWorksheets } from '../src';
-import { Transform } from 'stream';
-import { open } from 'fs';
+import { getXlsxStream, getWorksheets } from '../src';
+import { createReadStream } from 'fs';
 
 it('reads XLSX file correctly', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/basic.xlsx',
+    const stream = createReadStream('./tests/assets/basic.xlsx').pipe(getXlsxStream({
         sheet: 0,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -17,10 +15,9 @@ it('reads XLSX file correctly', async (done) => {
 
 it('reads empty XLSX file correctly', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/empty.xlsx',
+    const stream = createReadStream('./tests/assets/empty.xlsx').pipe(getXlsxStream({
         sheet: 0,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -30,11 +27,10 @@ it('reads empty XLSX file correctly', async (done) => {
 
 it('reads XLSX file with header', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/with-header.xlsx',
+    const stream = createReadStream('./tests/assets/with-header.xlsx').pipe(getXlsxStream({
         sheet: 0,
         withHeader: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -44,11 +40,10 @@ it('reads XLSX file with header', async (done) => {
 
 it('reads XLSX file with header values being dupicated', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/with-header-duplicated.xlsx',
+    const stream = createReadStream('./tests/assets/with-header-duplicated.xlsx').pipe(getXlsxStream({
         sheet: 0,
         withHeader: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -58,11 +53,10 @@ it('reads XLSX file with header values being dupicated', async (done) => {
 
 it('ignores empty rows', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/empty-rows.xlsx',
+    const stream = createReadStream('./tests/assets/empty-rows.xlsx').pipe(getXlsxStream({
         sheet: 0,
         ignoreEmpty: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -72,7 +66,7 @@ it('ignores empty rows', async (done) => {
 
 it('gets worksheets', async (done) => {
     const sheets = await getWorksheets({
-        filePath: './tests/assets/worksheets.xlsx',
+        stream: createReadStream('./tests/assets/worksheets.xlsx'),
     });
     expect(sheets).toEqual([
         { name: 'Sheet1', hidden: false, },
@@ -85,7 +79,7 @@ it('gets worksheets', async (done) => {
 
 it('gets worksheets with correct hidden info', async (done) => {
     const sheets = await getWorksheets({
-        filePath: './tests/assets/hidden-sheet.xlsx',
+        stream: createReadStream('./tests/assets/hidden-sheet.xlsx'),
     });
     expect(sheets).toEqual([
         { name: 'Sheet1', hidden: false, },
@@ -95,27 +89,12 @@ it('gets worksheets with correct hidden info', async (done) => {
     done();
 });
 
-it('gets worksheet by name, even if they are reordered', async (done) => {
+it.only('gets worksheet by index, even if they are reordered', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/worksheets-reordered.xlsx',
-        sheet: 'Sheet1',
-        ignoreEmpty: true,
-    });
-    stream.on('data', x => data.push(x));
-    stream.on('end', () => {
-        expect(data).toMatchSnapshot();
-        done();
-    })
-});
-
-it('gets worksheet by index, even if they are reordered', async (done) => {
-    const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/worksheets-reordered.xlsx',
+    const stream = createReadStream('./tests/assets/worksheets-reordered.xlsx').pipe(getXlsxStream({
         sheet: 1,
         ignoreEmpty: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -125,11 +104,10 @@ it('gets worksheet by index, even if they are reordered', async (done) => {
 
 it(`doesn't fail when empty row has custom height`, async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/empty-row-custom-height.xlsx',
+    const stream = createReadStream('./tests/assets/empty-row-custom-height.xlsx').pipe(getXlsxStream({
         sheet: 0,
         ignoreEmpty: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
@@ -138,82 +116,20 @@ it(`doesn't fail when empty row has custom height`, async (done) => {
 });
 
 it(`throws expected bad archive error`, async (done) => {
-    const data: any = [];
-    try {
-        const stream = await getXlsxStream({
-            filePath: './tests/assets/bad-archive.xlsx',
-            sheet: 0,
-        });
-    } catch (err) {
+    createReadStream('./tests/assets/bad-archive.xlsx').pipe(getXlsxStream({
+        sheet: 0,
+    })).on('error', (err) => {
         expect(err).toMatchSnapshot();
         done();
-    }
-});
-
-it(`reads 2 sheets from XLSX file using generator`, async (done) => {
-    const data: any = [];
-    const generator = await getXlsxStreams({
-        filePath: './tests/assets/worksheets-reordered.xlsx',
-        sheets: [
-            {
-                id: 2,
-                ignoreEmpty: true
-            },
-            {
-                id: 'Sheet1',
-                ignoreEmpty: true
-            }
-        ]
     });
-    function processSheet(stream: Transform) {
-        return new Promise((resolve, reject) => {
-            stream.on('data', (x: any) => data.push(x));
-            stream.on('end', () => { resolve() });
-        });
-    }
-    for await (const stream of generator) {
-        await processSheet(stream);
-    }
-    expect(data).toMatchSnapshot();
-    done();
-});
-
-it('fills merged cells with data', async (done) => {
-    const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/merged-cells.xlsx',
-        sheet: 0,
-        fillMergedCells: true,
-    });
-    stream.on('data', x => data.push(x));
-    stream.on('end', () => {
-        expect(data).toMatchSnapshot();
-        done();
-    })
-});
-
-it('fills merged cells with data if header has merged cells', async (done) => {
-    const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/merged-cells-with-header.xlsx',
-        sheet: 0,
-        fillMergedCells: true,
-        withHeader: true,
-    });
-    stream.on('data', x => data.push(x));
-    stream.on('end', () => {
-        expect(data).toMatchSnapshot();
-        done();
-    })
 });
 
 it('correctly handles shared string if it has just one value in cell', async (done) => {
     const data: any = [];
-    const stream = await getXlsxStream({
-        filePath: './tests/assets/shared-string-single-value.xlsx',
+    const stream = createReadStream('./tests/assets/shared-string-single-value.xlsx').pipe(getXlsxStream({
         sheet: 0,
         ignoreEmpty: true,
-    });
+    }));
     stream.on('data', x => data.push(x));
     stream.on('end', () => {
         expect(data).toMatchSnapshot();
