@@ -108,93 +108,103 @@ export function getXlsxStream (options: IXlsxStreamOptions): Transform {
     const formats: (string | number)[] = [];
     const strings: string[] = [];
     const sheetId = options.sheet + 1
-    return Combine(unzip.Parse(), new Transform({
-        objectMode: true,
-        transform: function(entry, e, cb) {
-            const filePath = entry.path;
-            switch (filePath) {
-                case 'xl/workbook.xml':
-                    entry.pipe(saxStream({
-                        strict: true,
-                        tag: 'sheet'
-                    })).on('data', (x: any) => {
-                        const attribs = x.attribs;
-                        sheets.push(attribs.name);
-                    }).on('end', cb);
-                    break;
-                case 'xl/styles.xml':
-                    entry.pipe(saxStream({
-                        strict: true,
-                        tag: ['cellXfs', 'numFmts']
-                    })).on('data', (x: any) => {
-                        if (x.tag === 'numFmts' && x.record.children) {
-                            const children = x.record.children.numFmt.length ? x.record.children.numFmt : [x.record.children.numFmt];
-                            for (let i = 0; i < children.length; i++) {
-                                numberFormats[Number(children[i].attribs.numFmtId)] = children[i].attribs.formatCode;
-                            }
-                        } else if (x.tag === 'cellXfs' && x.record.children) {
-                            for (let i = 0; i < x.record.children.xf.length; i++) {
-                                const ch = x.record.children.xf[i];
-                                formats[i] = Number(ch.attribs.numFmtId);
-                            }
-                        }
-                    }).on('end', () => {
-                        for (let i = 0; i < formats.length; i++) {
-                            const format = numberFormats[formats[i]];
-                            if (format) {
-                                formats[i] = format;
-                            }
-                        }
-                        return cb();
-                    });
-                    break;
-                case 'xl/sharedStrings.xml':
-                    console.log({ SHAREDSTRINGS: '1' })
-                    entry.pipe(saxStream({
-                        strict: true,
-                        tag: 'si'
-                    })).on('data', (x: any) => {
-                        if (x.children.t) {
-                            strings.push(x.children.t.value);
-                        } else if (!x.children.r.length) {
-                            strings.push(x.children.r.children.t.value);
-                        } else {
-                            let str = '';
-                            for (let i = 0; i < x.children.r.length; i++) {
-                                str += x.children.r[i].children.t.value;
-                            }
-                            strings.push(str);
-                        }
-                    }).on('end', cb);
-                    break;
-                case `xl/worksheets/sheet${sheetId}.xml`:
-                    console.log({ SHEET: '1' })
-                    const self = this   
-                    const pushChunk = function (chunk: any) {
-                        if (self.readableLength >= self.readableHighWaterMark) {
-                            // Not ready to push now
-                            return process.nextTick(pushChunk, [chunk])
-                        }
-                        return self.push(chunk)
-                    }
-                    entry
-                        .pipe(saxStream({
+    // Note: we need to transform sheet stream into row after parsing shared strings
+    return Combine(
+        unzip.Parse(), // Parse zip
+        new Transform({ // Read workbook to get sheets names, get shared strings and push sheets stream for next transform
+            objectMode: true,
+            transform: function(entry, e, cb) {
+                const filePath = entry.path;
+                switch (filePath) {
+                    case 'xl/workbook.xml':
+                        entry.pipe(saxStream({
                             strict: true,
-                            tag: 'row'
-                        }))
-                        .pipe(getTransform(formats, strings, options.withHeader, options.ignoreEmpty))
-                        .on('data', (chunk: any) => {
-                            return pushChunk(chunk)
-                        })
-                        .on('end', cb);
-                    break;
-                default:
-                    entry.autodrain();
-                    return cb();
-                    
+                            tag: 'sheet'
+                        })).on('data', (x: any) => {
+                            const attribs = x.attribs;
+                            sheets.push(attribs.name);
+                        }).on('end', cb);
+                        break;
+                    case 'xl/styles.xml':
+                        entry.pipe(saxStream({
+                            strict: true,
+                            tag: ['cellXfs', 'numFmts']
+                        })).on('data', (x: any) => {
+                            if (x.tag === 'numFmts' && x.record.children) {
+                                const children = x.record.children.numFmt.length ? x.record.children.numFmt : [x.record.children.numFmt];
+                                for (let i = 0; i < children.length; i++) {
+                                    numberFormats[Number(children[i].attribs.numFmtId)] = children[i].attribs.formatCode;
+                                }
+                            } else if (x.tag === 'cellXfs' && x.record.children) {
+                                for (let i = 0; i < x.record.children.xf.length; i++) {
+                                    const ch = x.record.children.xf[i];
+                                    formats[i] = Number(ch.attribs.numFmtId);
+                                }
+                            }
+                        }).on('end', () => {
+                            for (let i = 0; i < formats.length; i++) {
+                                const format = numberFormats[formats[i]];
+                                if (format) {
+                                    formats[i] = format;
+                                }
+                            }
+                            return cb();
+                        });
+                        break;
+                    case 'xl/sharedStrings.xml':
+                        console.log({ sharedStrings: 'lllllll' })
+                        entry.pipe(saxStream({
+                            strict: true,
+                            tag: 'si'
+                        })).on('data', (x: any) => {
+                            if (x.children.t) {
+                                strings.push(x.children.t.value);
+                            } else if (!x.children.r.length) {
+                                strings.push(x.children.r.children.t.value);
+                            } else {
+                                let str = '';
+                                for (let i = 0; i < x.children.r.length; i++) {
+                                    str += x.children.r[i].children.t.value;
+                                }
+                                strings.push(str);
+                            }
+                        }).on('end', cb);
+                        break;
+                    case `xl/worksheets/sheet${sheetId}.xml`:
+                        this.push(entry)
+                        return cb();
+                    default:
+                        entry.autodrain();
+                        return cb();
+                        
+                }
             }
-        }
-    }))
+        }),
+        new Transform({ // Take each chunk (worksheet stream) and push rows
+            objectMode: true,
+            transform (chunk: Readable, encoding, cb) {
+                console.log('entry stream')
+                const self = this   
+                const pushChunk = function (chunk: any) {
+                    if (self.readableLength >= self.readableHighWaterMark) {
+                        // Not ready to push now
+                        return process.nextTick(pushChunk, [chunk])
+                    }
+                    return self.push(chunk)
+                }
+                chunk
+                    .pipe(saxStream({
+                        strict: true,
+                        tag: 'row'
+                    }))
+                    .pipe(getTransform(formats, strings, options.withHeader, options.ignoreEmpty))
+                    .on('data', (chunk: any) => {
+                        return pushChunk(chunk)
+                    })
+                    .on('end', cb);
+            }
+        })
+    )
 }
 
 export function getWorksheets(options: IWorksheetOptions) {
